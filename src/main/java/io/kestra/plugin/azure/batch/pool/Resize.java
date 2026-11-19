@@ -1,8 +1,7 @@
 package io.kestra.plugin.azure.batch.pool;
 
-import com.microsoft.azure.batch.BatchClient;
-import com.microsoft.azure.batch.protocol.models.CloudPool;
-import com.microsoft.azure.batch.protocol.models.PoolState;
+import com.azure.compute.batch.models.BatchPoolResizeParameters;
+import com.azure.compute.batch.models.BatchPoolState;
 
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
@@ -77,37 +76,38 @@ public class Resize extends AbstractBatch implements RunnableTask<Resize.Output>
 
     @Override
     public Output run(RunContext runContext) throws Exception {
-        BatchClient client = BatchService.client(this.endpoint, this.account, this.accessKey, runContext);
+        var client = BatchService.batchClient(this.endpoint, this.account, this.accessKey, runContext);
 
-        String poolId = runContext.render(this.poolId).as(String.class).orElseThrow();
+        var rPoolId = runContext.render(this.poolId).as(String.class)
+            .orElseThrow(() -> new IllegalArgumentException("'poolId' is required, set it to the ID of an existing Batch pool"));
 
-        if (!client.poolOperations().existsPool(poolId)) {
-            throw new IllegalArgumentException("Pool '" + poolId + "' doesn't exists");
+        if (!client.poolExists(rPoolId)) {
+            throw new IllegalArgumentException("Pool '" + rPoolId + "' doesn't exists");
         }
 
-        CloudPool pool = client.poolOperations().getPool(poolId);
+        var pool = client.getPool(rPoolId);
 
-        if (!pool.state().equals(PoolState.ACTIVE)) {
-            throw new IllegalArgumentException("Pool '" + poolId + "' is not active, state: '" + pool.state() + "'");
+        if (!BatchPoolState.ACTIVE.equals(pool.getState())) {
+            throw new IllegalArgumentException("Pool '" + rPoolId + "' is not active, state: '" + pool.getState() + "'");
         }
 
-        client
-            .poolOperations()
-            .resizePool(
-                poolId,
-                runContext.render(this.targetDedicatedNodes).as(Integer.class).orElseThrow(),
-                runContext.render(this.targetLowPriorityNodes).as(Integer.class).orElseThrow()
-            );
+        // Starts the resize; PoolService waits for the steady state and an idle node.
+        client.beginResizePool(
+            rPoolId,
+            new BatchPoolResizeParameters()
+                .setTargetDedicatedNodes(runContext.render(this.targetDedicatedNodes).as(Integer.class).orElse(0))
+                .setTargetLowPriorityNodes(runContext.render(this.targetLowPriorityNodes).as(Integer.class).orElse(0))
+        );
 
-        CloudPool cloudPool = PoolService.waitForReady(runContext, client, pool);
+        var resizedPool = PoolService.waitForReady(runContext, client, pool);
 
         return Output
             .builder()
             .pool(
                 Pool.builder()
-                    .id(cloudPool.id())
-                    .targetDedicatedNodes(cloudPool.targetDedicatedNodes())
-                    .targetLowPriorityNodes(cloudPool.targetLowPriorityNodes())
+                    .id(resizedPool.getId())
+                    .targetDedicatedNodes(resizedPool.getTargetDedicatedNodes())
+                    .targetLowPriorityNodes(resizedPool.getTargetLowPriorityNodes())
                     .build()
             )
             .build();

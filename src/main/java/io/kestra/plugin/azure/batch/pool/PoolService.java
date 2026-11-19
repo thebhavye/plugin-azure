@@ -1,34 +1,32 @@
 package io.kestra.plugin.azure.batch.pool;
 
-import java.io.IOException;
 import java.time.Duration;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import com.microsoft.azure.batch.BatchClient;
-import com.microsoft.azure.batch.DetailLevel;
-import com.microsoft.azure.batch.protocol.models.AllocationState;
-import com.microsoft.azure.batch.protocol.models.CloudPool;
-import com.microsoft.azure.batch.protocol.models.ComputeNode;
+import com.azure.compute.batch.BatchClient;
+import com.azure.compute.batch.models.AllocationState;
+import com.azure.compute.batch.models.BatchNodesListOptions;
+import com.azure.compute.batch.models.BatchPool;
 
 import io.kestra.core.runners.RunContext;
 
 public class PoolService {
-    public static CloudPool waitForReady(RunContext runContext, BatchClient client, CloudPool pool) throws TimeoutException, InterruptedException, IOException {
-        Duration poolSteadyTimeout = Duration.ofMinutes(5);
-        Duration vmReadyTimeout = Duration.ofMinutes(20);
-        long startTime = System.currentTimeMillis();
-        long elapsedTime = 0L;
-        boolean steady = false;
+    public static BatchPool waitForReady(RunContext runContext, BatchClient client, BatchPool pool) throws TimeoutException, InterruptedException {
+        var poolSteadyTimeout = Duration.ofMinutes(5);
+        var vmReadyTimeout = Duration.ofMinutes(20);
+        var startTime = System.currentTimeMillis();
+        var elapsedTime = 0L;
+        var steady = false;
 
         // Wait for the VM to be allocated
         runContext.logger().trace("Waiting for pool to resize.");
         while (elapsedTime < poolSteadyTimeout.toMillis()) {
-            pool = client.poolOperations().getPool(pool.id());
+            pool = client.getPool(pool.getId());
 
-            if (pool.allocationState() == AllocationState.STEADY) {
+            if (AllocationState.STEADY.equals(pool.getAllocationState())) {
                 steady = true;
                 break;
             }
@@ -47,19 +45,15 @@ public class PoolService {
         // The following code is just an example of how to poll for the VM state
         startTime = System.currentTimeMillis();
         elapsedTime = 0L;
-        boolean hasIdleVM = false;
+        var hasIdleVM = false;
+        var idleNodes = new BatchNodesListOptions()
+            .setSelect(List.of("id", "state"))
+            .setFilter("state eq 'idle'");
 
         // Wait for at least 1 VM to reach the IDLE state
         runContext.logger().trace("Waiting for VMs to start.");
         while (elapsedTime < vmReadyTimeout.toMillis()) {
-            List<ComputeNode> nodeCollection = client
-                .computeNodeOperations()
-                .listComputeNodes(
-                    pool.id(),
-                    new DetailLevel.Builder().withSelectClause("id, state").withFilterClause("state eq 'idle'").build()
-                );
-
-            if (!nodeCollection.isEmpty()) {
+            if (client.listNodes(pool.getId(), idleNodes).stream().findAny().isPresent()) {
                 hasIdleVM = true;
                 break;
             }

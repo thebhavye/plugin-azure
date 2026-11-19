@@ -1,7 +1,6 @@
 package io.kestra.plugin.azure.batch.job;
 
 import java.io.File;
-import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
 import java.util.*;
@@ -11,11 +10,13 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
 
+import com.azure.compute.batch.BatchClient;
+import com.azure.compute.batch.models.BatchErrorException;
+import com.azure.compute.batch.models.BatchTask;
+import com.azure.compute.batch.models.BatchTaskCreateParameters;
+import com.azure.compute.batch.models.BatchTaskFilesListOptions;
+import com.azure.core.exception.AzureException;
 import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.microsoft.azure.PagedList;
-import com.microsoft.azure.batch.BatchClient;
-import com.microsoft.azure.batch.DetailLevel;
-import com.microsoft.azure.batch.protocol.models.*;
 
 import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.models.annotations.Example;
@@ -223,23 +224,22 @@ public class Create extends AbstractBatch implements RunnableTask<Create.Output>
         }
 
         Logger logger = runContext.logger();
-        BatchClient client = BatchService.client(this.endpoint, this.account, this.accessKey, runContext);
+        BatchClient client = BatchService.batchClient(this.endpoint, this.account, this.accessKey, runContext);
 
         Map<String, Integer> tasksMapping = new HashMap<>();
         String jobId = null;
-        if (Boolean.TRUE.equals(runContext.render(resume).as(Boolean.class).orElseThrow())) {
+        if (Boolean.TRUE.equals(runContext.render(resume).as(Boolean.class).orElse(true))) {
             String baseJobName = ScriptService.jobName(runContext);
             baseJobName = baseJobName.substring(0, baseJobName.lastIndexOf('-') + 1);
-            var cloudJob = BatchService.getExistingJob(runContext, client, baseJobName);
-            if (cloudJob.isPresent()) {
-                jobId = cloudJob.get().id();
+            var existingJob = BatchService.getExistingBatchJob(runContext, client, baseJobName);
+            if (existingJob.isPresent()) {
+                jobId = existingJob.get().getId();
                 logger.info("Job is resumed from an already running job {} ", jobId);
 
                 // re-create the task mapping
                 int index = 0;
-                var existingTasks = client.taskOperations().listTasks(jobId).stream().toList();
-                for (CloudTask current : existingTasks) {
-                    tasksMapping.put(current.id(), index);
+                for (BatchTask current : client.listTasks(jobId)) {
+                    tasksMapping.put(current.getId(), index);
                     index++;
                 }
             }
@@ -248,33 +248,33 @@ public class Create extends AbstractBatch implements RunnableTask<Create.Output>
         try {
             if (jobId == null) {
                 // create job
-                PoolInformation poolInfo = new PoolInformation()
-                    .withPoolId(runContext.render(poolId).as(String.class).orElseThrow());
+                var rPoolId = runContext.render(poolId).as(String.class)
+                    .orElseThrow(() -> new IllegalArgumentException("'poolId' is required, set it to the ID of an existing Batch pool"));
 
-                final JobAddParameter job = this.job.to(runContext, poolInfo);
-                jobId = job.id();
-                client.jobOperations().createJob(job);
+                var job = this.job.toBatch(runContext, rPoolId);
+                jobId = job.getId();
+                client.createJob(job);
 
-                logger.info("Job '{}' created on pool '{}'", jobId, poolInfo.poolId());
+                logger.info("Job '{}' created on pool '{}'", jobId, rPoolId);
 
                 // create tasks
-                List<TaskAddParameter> tasks = new ArrayList<>();
+                List<BatchTaskCreateParameters> tasks = new ArrayList<>();
                 int index = 0;
                 for (Task current : this.tasks) {
-                    TaskAddParameter taskAddParameter = current.to(runContext);
+                    var taskCreateParameters = current.toBatch(runContext);
 
-                    tasksMapping.put(taskAddParameter.id(), index);
-                    tasks.add(taskAddParameter);
+                    tasksMapping.put(taskCreateParameters.getId(), index);
+                    tasks.add(taskCreateParameters);
 
                     index++;
                 }
 
                 if (logger.isDebugEnabled()) {
                     tasks
-                        .forEach(task -> logger.debug("Starting task '{}' with command: {}", task.id(), task.commandLine()));
+                        .forEach(task -> logger.debug("Starting task '{}' with command: {}", task.getId(), task.getCommandLine()));
                 }
 
-                client.taskOperations().createTasks(jobId, tasks);
+                client.createTasks(jobId, tasks);
             }
 
             String finalJobId = jobId;
@@ -289,33 +289,35 @@ public class Create extends AbstractBatch implements RunnableTask<Create.Output>
             );
 
             // get tasks result
-            List<CloudTask> results = client.taskOperations().listTasks(jobId);
+            var results = client.listTasks(jobId).stream().toList();
 
             // failed ?
-            List<CloudTask> failed = results.stream()
-                .filter(cloudTask -> cloudTask.executionInfo().failureInfo() != null)
+            var failed = results.stream()
+                .filter(Create::hasFailed)
                 .toList();
 
             // populate results
             Map<String, Object> outputs = new ConcurrentHashMap<>();
             Map<String, URI> outputFiles = new ConcurrentHashMap<>();
 
-            for (CloudTask task : results) {
-                if (task.executionInfo().failureInfo() != null) {
-                    logger.warn("Task '{}' failed with exit code '{}': {}", task.id(), task.executionInfo().exitCode(), task.executionInfo().failureInfo().message());
+            for (BatchTask task : results) {
+                var executionInfo = task.getExecutionInfo();
+                if (hasFailed(task)) {
+                    logger.warn("Task '{}' failed with exit code '{}': {}", task.getId(), executionInfo.getExitCode(), executionInfo.getFailureInfo().getMessage());
                 } else {
-                    logger.info("Task ended '{}' with exit code '{}'", task.id(), task.executionInfo().exitCode());
+                    logger.info("Task ended '{}' with exit code '{}'", task.getId(), executionInfo == null ? null : executionInfo.getExitCode());
                 }
 
                 // metrics
-                if (task.stats() != null) {
-                    runContext.metric(Counter.of("io.read.ops.count", task.stats().readIOps()));
-                    runContext.metric(Counter.of("io.read.gib.count", task.stats().readIOGiB()));
-                    runContext.metric(Counter.of("io.write.ops.count", task.stats().writeIOps()));
-                    runContext.metric(Counter.of("io.write.gib.count", task.stats().writeIOGiB()));
-                    runContext.metric(Timer.of("cpu.kernel.duration", Duration.ofMillis(task.stats().kernelCPUTime().getMillis())));
-                    runContext.metric(Timer.of("cpu.user.duration", Duration.ofMillis(task.stats().userCPUTime().getMillis())));
-                    runContext.metric(Timer.of("wall.clock.duration", Duration.ofMillis(task.stats().wallClockTime().getMillis())));
+                var stats = task.getTaskStatistics();
+                if (stats != null) {
+                    runContext.metric(Counter.of("io.read.ops.count", stats.getReadIops()));
+                    runContext.metric(Counter.of("io.read.gib.count", stats.getReadIoGiB()));
+                    runContext.metric(Counter.of("io.write.ops.count", stats.getWriteIops()));
+                    runContext.metric(Counter.of("io.write.gib.count", stats.getWriteIoGiB()));
+                    runContext.metric(Timer.of("cpu.kernel.duration", stats.getKernelCpuTime()));
+                    runContext.metric(Timer.of("cpu.user.duration", stats.getUserCpuTime()));
+                    runContext.metric(Timer.of("wall.clock.duration", stats.getWallClockTime()));
                 }
 
                 // log
@@ -331,16 +333,16 @@ public class Create extends AbstractBatch implements RunnableTask<Create.Output>
                     outputs.putAll(logConsumer.getOutputs());
                 });
 
-                if (task.executionInfo().failureInfo() != null) {
+                if (hasFailed(task)) {
                     continue;
                 }
 
                 // outputsFiles
-                Task currentTask = this.tasks.get(tasksMapping.get(task.id()));
+                Task currentTask = this.tasks.get(tasksMapping.get(task.getId()));
                 String remoteWorkingDir = "wd/";
                 if (currentTask.getOutputFiles() != null) {
                     for (String s : runContext.render(currentTask.getOutputFiles()).asList(String.class)) {
-                        File file = TaskService.readRemoteFile(runContext, client, jobId, task, remoteWorkingDir + s, s, true);
+                        File file = TaskService.readRemoteFile(runContext, client, jobId, task, remoteWorkingDir + s, s);
 
                         // As this task is used in the task runner, this processing is already done by the CommandsWrapper so we need some guard
                         if (pushOutputFilesToInternalStorage) {
@@ -353,24 +355,24 @@ public class Create extends AbstractBatch implements RunnableTask<Create.Output>
                 boolean renderedSyncWorkingDirectory = runContext.render(syncWorkingDirectory).as(Boolean.class).orElseThrow();
                 // If we need to sync working directory or have output directories, we need to list all remote files to know which files we are interested in
                 if (renderedSyncWorkingDirectory || !renderedOutputDirs.isEmpty()) {
-                    PagedList<NodeFile> nodeFiles = client.fileOperations()
-                        .listFilesFromTask(jobId, task.id(), true, new DetailLevel.Builder().build());
+                    var nodeFiles = client.listTaskFiles(jobId, task.getId(), new BatchTaskFilesListOptions().setRecursive(true));
 
-                    for (NodeFile nodeFile : nodeFiles) {
+                    for (var nodeFile : nodeFiles) {
+                        var nodeFileName = nodeFile.getName();
                         // Filter out directories and files not in the working directory
-                        if (!nodeFile.name().startsWith(remoteWorkingDir) || nodeFile.isDirectory() || nodeFile.name().endsWith("/" + DIRECTORY_MARKER)) {
+                        if (!nodeFileName.startsWith(remoteWorkingDir) || Boolean.TRUE.equals(nodeFile.isDirectory()) || nodeFileName.endsWith("/" + DIRECTORY_MARKER)) {
                             continue;
                         }
 
                         // We check if the file is in one of the output directories to know if we should push it to outputFiles later on
                         Optional<String> parentOutputDirectory = renderedOutputDirs.stream()
-                            .filter(s -> nodeFile.name().startsWith(remoteWorkingDir + s + "/"))
+                            .filter(s -> nodeFileName.startsWith(remoteWorkingDir + s + "/"))
                             .findFirst();
                         if (parentOutputDirectory.isPresent() || renderedSyncWorkingDirectory) {
-                            String relativeFileName = nodeFile.name().substring(remoteWorkingDir.length());
+                            String relativeFileName = nodeFileName.substring(remoteWorkingDir.length());
 
                             // This will download the file to runContext wdir so it will already perform the syncWorkingDirectory
-                            File file = TaskService.readRemoteFile(runContext, client, jobId, task, nodeFile.name(), relativeFileName, true);
+                            File file = TaskService.readRemoteFile(runContext, client, jobId, task, nodeFileName, relativeFileName);
 
                             // We only push the file to outputFiles if it's in one of the output directories
                             if (parentOutputDirectory.isPresent() && pushOutputFilesToInternalStorage) {
@@ -391,11 +393,12 @@ public class Create extends AbstractBatch implements RunnableTask<Create.Output>
                 .outputFiles(outputFiles)
                 .build();
         } catch (BatchErrorException e) {
-            if (e.body() != null) {
-                logger.error("Code '{}', Message '{}'", e.body().code(), e.body().message().value());
-                if (e.body().values() != null) {
-                    for (BatchErrorDetail detail : e.body().values()) {
-                        logger.warn("Detail '{}'='{}'", detail.key(), detail.value());
+            var error = e.getValue();
+            if (error != null) {
+                logger.error("Code '{}', Message '{}'", error.getCode(), error.getMessage() == null ? null : error.getMessage().getValue());
+                if (error.getValues() != null) {
+                    for (var detail : error.getValues()) {
+                        logger.warn("Detail '{}'='{}'", detail.getKey(), detail.getValue());
                     }
                 }
             }
@@ -406,14 +409,19 @@ public class Create extends AbstractBatch implements RunnableTask<Create.Output>
         }
     }
 
+    private static boolean hasFailed(BatchTask task) {
+        return task.getExecutionInfo() != null && task.getExecutionInfo().getFailureInfo() != null;
+    }
+
     private void safelyKillJobTask(final RunContext runContext,
         final BatchClient client,
         final String jobId) throws IllegalVariableEvaluationException {
         if (runContext.render(delete).as(Boolean.class).orElse(true)) {
             try {
-                client.jobOperations().deleteJob(jobId);
-                runContext.logger().debug("Job deleted: {}", jobId);
-            } catch (IOException e) {
+                // Only starts the deletion: Batch removes the job and its tasks in the background.
+                client.beginDeleteJob(jobId);
+                runContext.logger().debug("Job deletion started: {}", jobId);
+            } catch (AzureException e) {
                 runContext.logger().warn("Failed to delete job: {}.", jobId, e);
             }
         }
